@@ -58,7 +58,7 @@
 import { Address, Cell, Dictionary, beginCell } from "https://esm.sh/@ton/core@0.59.0";
 import { Buffer } from "https://esm.sh/buffer@6.0.3";
 
-const CONTRACT = "EQCH5lZCBZ7sOKZh6eFHfSGYEkASQZwMD8VHzLeOM5-cpeNk";
+const CONTRACT = "EQBdcJsNkghVtqEQ24lP9OwpFmiuzqgmAln_7nO_L5XqYH5n";
 const TONAPI = "https://tonapi.io";
 const OP_UNLOCK = 2337577242;   // 0x8B527ADA
 const OP_EMERG  = 3065175784;   // 0xB6B6FF68
@@ -89,9 +89,9 @@ async function nextId(){
 
 async function lockInfo(id){
   const s = await getter("lockInfo", id);
-  if(num(s[0]) === 0n) return null; // exists=false (TVM true = -1)
+  if(num(s[0].num) === 0n) return null; // exists=false (TVM true = -1)
   let owner=null; try{ owner = Cell.fromBoc(Buffer.from(s[1].cell,"hex"))[0].beginParse().loadAddress(); }catch(_){}
-  return { id, owner, amount:Number(num(s[2]))/1e9, unlockAt:Number(num(s[3])), createdAt:Number(num(s[4])), tranches:Number(num(s[5])), claimed:Number(num(s[6])) };
+  return { id, owner, amount:Number(num(s[2].num))/1e9, unlockAt:Number(num(s[3].num)), createdAt:Number(num(s[4].num)), tranches:Number(num(s[5].num)), claimed:Number(num(s[6].num)), hardLock: s[7]?num(s[7].num)!==0n:false };
 }
 
 function unlockLink(id, emergency){
@@ -134,12 +134,14 @@ window.findLocks = async function(){
   box.innerHTML = mine.map(l=>{
     const matured = now>=l.unlockAt;
     const vest = l.tranches>1?`<div class="meta">вестинг ${l.claimed}/${l.tranches} частей</div>`:"";
+    const hardBadge = l.hardLock?`<div class="meta" style="color:var(--red)">🔒 жёсткий · без досрочного вывода</div>`:"";
+    const emerg = l.hardLock?"":`<a class="a-emerg" href="${unlockLink(l.id,true)}">Срочно −10%</a>`;
     return `<div class="lock">
-      <div class="row"><div><div class="amt">${fmtN(l.amount)} GRM</div>${vest}</div>
+      <div class="row"><div><div class="amt">${fmtN(l.amount)} GRM</div>${vest}${hardBadge}</div>
       <div style="text-align:right"><div class="meta">лок #${l.id}</div><div class="meta">разлок: ${fmtDate(l.unlockAt)}</div></div></div>
       <div class="actions">
         <a class="a-claim ${matured?"":"off"}" href="${unlockLink(l.id,false)}">${matured?"Забрать 100%":"⏳ ещё заперт"}</a>
-        <a class="a-emerg" href="${unlockLink(l.id,true)}">Срочно −10%</a>
+        ${emerg}
       </div></div>`;
   }).join("");
 };
