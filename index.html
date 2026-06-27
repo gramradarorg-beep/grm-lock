@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GRM Lock — Аварийный разлок</title>
+<style>
+  :root{--bg:#020408;--bg2:#0a1628;--bg3:#0d2040;--acc:#4fc3f7;--green:#4ade80;--red:#f87171;--gold:#f59e0b;--text:#e2f0ff;--sub:#4a7a9a}
+  *{box-sizing:border-box;margin:0;padding:0;font-family:system-ui,-apple-system,sans-serif}
+  body{background:linear-gradient(180deg,#020408,#0a1628);color:var(--text);min-height:100vh;padding:20px}
+  .wrap{max-width:640px;margin:0 auto}
+  h1{font-size:22px;margin-bottom:4px}h1 span{color:var(--acc)}
+  .sub{color:var(--sub);font-size:13px;line-height:1.6;margin-bottom:18px}
+  .card{background:var(--bg2);border:1px solid var(--bg3);border-radius:14px;padding:16px;margin-bottom:12px}
+  input{width:100%;background:#0a1422;border:1px solid var(--bg3);border-radius:10px;color:var(--text);padding:12px 14px;font-size:15px}
+  button{width:100%;margin-top:10px;background:var(--acc);color:#021018;border:none;border-radius:10px;padding:13px;font-size:15px;font-weight:700;cursor:pointer}
+  button:disabled{opacity:.5}
+  .lock{background:#0a1422;border:1px solid var(--bg3);border-radius:12px;padding:14px;margin-top:10px}
+  .row{display:flex;justify-content:space-between;align-items:center}
+  .amt{font-size:18px;font-weight:700;color:var(--acc)}
+  .meta{font-size:12px;color:var(--sub);margin-top:3px}
+  .actions{display:flex;gap:8px;margin-top:10px}
+  .actions a{flex:1;text-align:center;text-decoration:none;padding:9px;border-radius:9px;font-size:13px;font-weight:600}
+  .a-claim{background:rgba(74,222,128,.14);border:1px solid rgba(74,222,128,.4);color:var(--green)}
+  .a-claim.off{background:#0a1422;border-color:var(--bg3);color:var(--sub);pointer-events:none}
+  .a-emerg{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.4);color:var(--red)}
+  .note{font-size:11px;color:var(--sub);margin-top:14px;line-height:1.6}
+  code{background:#0a1422;padding:2px 6px;border-radius:5px;font-size:11px;word-break:break-all}
+  .err{color:var(--red);font-size:13px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔒 GRM Lock — <span>аварийный разлок</span></h1>
+  <p class="sub">
+    Автономный инструмент. Работает напрямую с блокчейном TON, <b>не зависит от серверов Gram Radar</b>.
+    Введи адрес своего TON-кошелька — найдём твои локи и дадим готовые кнопки возврата GRM через Tonkeeper.
+    Деньги уходят строго на кошелёк-владельца лока.
+  </p>
+
+  <div class="card">
+    <input id="wallet" placeholder="Твой TON-адрес (EQ… / UQ…)" autocomplete="off">
+    <button id="find" onclick="findLocks()">Найти мои локи</button>
+    <div id="status" class="err"></div>
+  </div>
+
+  <div id="locks"></div>
+
+  <p class="note">
+    Контракт лока (проверяй сам): <code id="caddr"></code><br>
+    Разлок — это сообщение контракту <code>op 0x8B527ADA (Unlock) + lockId</code> (после срока, 100%)
+    или <code>op 0xB6B6FF68 (EmergencyUnlock) + lockId</code> (досрочно, −10%). Газ ~0.07 / 0.13 TON.
+    Кнопки ниже формируют ровно это. Исходный контракт и инструкция — в репозитории.
+  </p>
+</div>
+
+<script type="module">
+import { Address, Cell, Dictionary, beginCell } from "https://esm.sh/@ton/core@0.59.0";
+import { Buffer } from "https://esm.sh/buffer@6.0.3";
+
+const CONTRACT = "EQCH5lZCBZ7sOKZh6eFHfSGYEkASQZwMD8VHzLeOM5-cpeNk";
+const TONAPI = "https://tonapi.io";
+const OP_UNLOCK = 2337577242;   // 0x8B527ADA
+const OP_EMERG  = 3065175784;   // 0xB6B6FF68
+document.getElementById("caddr").textContent = CONTRACT;
+
+const num = (v) => { v = String(v); return v[0] === "-" ? -BigInt(v.slice(1)) : BigInt(v); };
+const fmtN = (n) => Number(n).toLocaleString("ru-RU");
+function fmtDate(ts){ const d=new Date(ts*1000),p=n=>String(n).padStart(2,"0"); return `${p(d.getDate())}.${p(d.getMonth()+1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`; }
+const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+
+async function getter(method, args){
+  const q = args!=null ? `?args=${args}` : "";
+  const r = await fetch(`${TONAPI}/v2/blockchain/accounts/${CONTRACT}/methods/${method}${q}`).then(x=>x.json());
+  if(!r || !r.stack) throw new Error("RPC error");
+  return r.stack;
+}
+
+async function nextId(){
+  try{
+    const s = await getter("stats");
+    const cell = Cell.fromBoc(Buffer.from(s[0].cell,"hex"))[0];
+    const d = cell.beginParse().loadDictDirect(Dictionary.Keys.BigInt(257), Dictionary.Values.BigInt(257));
+    return Number(d.get(0n) ?? 0n);
+  }catch(_){ return 300; } // фолбэк — сканируем до 300
+}
+
+async function lockInfo(id){
+  const s = await getter("lockInfo", id);
+  if(num(s[0]) === 0n) return null; // exists=false (TVM true = -1)
+  let owner=null; try{ owner = Cell.fromBoc(Buffer.from(s[1].cell,"hex"))[0].beginParse().loadAddress(); }catch(_){}
+  return { id, owner, amount:Number(num(s[2]))/1e9, unlockAt:Number(num(s[3])), createdAt:Number(num(s[4])), tranches:Number(num(s[5])), claimed:Number(num(s[6])) };
+}
+
+function unlockLink(id, emergency){
+  const op = emergency ? OP_EMERG : OP_UNLOCK;
+  const body = beginCell().storeUint(op,32).storeUint(BigInt(id),64).endCell();
+  const bin = body.toBoc().toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  const amount = emergency ? "130000000" : "70000000";
+  return `https://app.tonkeeper.com/transfer/${CONTRACT}?amount=${amount}&bin=${bin}`;
+}
+
+window.findLocks = async function(){
+  const inp = document.getElementById("wallet").value.trim();
+  const st = document.getElementById("status");
+  const box = document.getElementById("locks");
+  st.textContent = ""; box.innerHTML = "";
+  let want;
+  try{ want = Address.parse(inp).toRawString(); }catch(_){ st.textContent="Неверный адрес кошелька"; return; }
+  const btn = document.getElementById("find"); btn.disabled=true; btn.textContent="Сканируем блокчейн…";
+  try{
+    const N = await nextId();
+    const mine = [];
+    for(let id=0; id<N; id++){
+      let info=null; try{ info=await lockInfo(id); }catch(_){}
+      if(info && info.owner && info.owner.toRawString()===want) mine.push(info);
+      await sleep(120); // бережно к публичному RPC
+    }
+    if(!mine.length){ box.innerHTML='<div class="card">Локов на этом кошельке не найдено.</div>'; return; }
+    const now = Math.floor(Date.now()/1000);
+    box.innerHTML = mine.map(l=>{
+      const matured = now>=l.unlockAt;
+      const vest = l.tranches>1?`<div class="meta">вестинг ${l.claimed}/${l.tranches} частей</div>`:"";
+      return `<div class="lock">
+        <div class="row"><div><div class="amt">${fmtN(l.amount)} GRM</div>${vest}</div>
+        <div style="text-align:right"><div class="meta">лок #${l.id}</div><div class="meta">разлок: ${fmtDate(l.unlockAt)}</div></div></div>
+        <div class="actions">
+          <a class="a-claim ${matured?"":"off"}" href="${unlockLink(l.id,false)}">${matured?"Забрать 100%":"⏳ ещё заперт"}</a>
+          <a class="a-emerg" href="${unlockLink(l.id,true)}">Срочно −10%</a>
+        </div></div>`;
+    }).join("");
+  }catch(e){ st.textContent="Ошибка: "+(e.message||e); }
+  finally{ btn.disabled=false; btn.textContent="Найти мои локи"; }
+};
+</script>
+</body>
+</html>
