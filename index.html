@@ -71,9 +71,11 @@ const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 
 async function getter(method, args){
   const q = args!=null ? `?args=${args}` : "";
-  const r = await fetch(`${TONAPI}/v2/blockchain/accounts/${CONTRACT}/methods/${method}${q}`).then(x=>x.json());
-  if(!r || !r.stack) throw new Error("RPC error");
-  return r.stack;
+  for(let i=0;i<4;i++){
+    try{ const r = await fetch(`${TONAPI}/v2/blockchain/accounts/${CONTRACT}/methods/${method}${q}`).then(x=>x.json()); if(r && r.stack) return r.stack; }catch(_){}
+    await sleep(1500); // публичный RPC бывает лимитит — ждём и повторяем
+  }
+  throw new Error("RPC error");
 }
 
 async function nextId(){
@@ -107,30 +109,39 @@ window.findLocks = async function(){
   st.textContent = ""; box.innerHTML = "";
   let want;
   try{ want = Address.parse(inp).toRawString(); }catch(_){ st.textContent="Неверный адрес кошелька"; return; }
-  const btn = document.getElementById("find"); btn.disabled=true; btn.textContent="Сканируем блокчейн…";
+  const btn = document.getElementById("find"); btn.disabled=true; btn.textContent="Ищем…";
+  let mine = null;
+  // 1) быстрый путь — API Gram Radar (если он работает)
   try{
-    const N = await nextId();
-    const mine = [];
-    for(let id=0; id<N; id++){
-      let info=null; try{ info=await lockInfo(id); }catch(_){}
-      if(info && info.owner && info.owner.toRawString()===want) mine.push(info);
-      await sleep(120); // бережно к публичному RPC
-    }
-    if(!mine.length){ box.innerHTML='<div class="card">Локов на этом кошельке не найдено.</div>'; return; }
-    const now = Math.floor(Date.now()/1000);
-    box.innerHTML = mine.map(l=>{
-      const matured = now>=l.unlockAt;
-      const vest = l.tranches>1?`<div class="meta">вестинг ${l.claimed}/${l.tranches} частей</div>`:"";
-      return `<div class="lock">
-        <div class="row"><div><div class="amt">${fmtN(l.amount)} GRM</div>${vest}</div>
-        <div style="text-align:right"><div class="meta">лок #${l.id}</div><div class="meta">разлок: ${fmtDate(l.unlockAt)}</div></div></div>
-        <div class="actions">
-          <a class="a-claim ${matured?"":"off"}" href="${unlockLink(l.id,false)}">${matured?"Забрать 100%":"⏳ ещё заперт"}</a>
-          <a class="a-emerg" href="${unlockLink(l.id,true)}">Срочно −10%</a>
-        </div></div>`;
-    }).join("");
-  }catch(e){ st.textContent="Ошибка: "+(e.message||e); }
-  finally{ btn.disabled=false; btn.textContent="Найти мои локи"; }
+    const r = await fetch("https://gramradar.org/api/lock/my?wallet="+encodeURIComponent(inp),{cache:"no-store"}).then(x=>x.json());
+    if(r && Array.isArray(r.locks)) mine = r.locks;
+  }catch(_){}
+  // 2) фолбэк — напрямую из блокчейна (если Gram Radar недоступен)
+  if(!mine){
+    btn.textContent="Сканирую блокчейн…";
+    try{
+      const N = await nextId(); mine = [];
+      for(let id=0; id<N; id++){
+        let info=null; try{ info=await lockInfo(id); }catch(_){}
+        if(info && info.owner && info.owner.toRawString()===want) mine.push(info);
+        await sleep(350);
+      }
+    }catch(e){ st.textContent="Не удалось прочитать блокчейн: "+(e.message||e); btn.disabled=false; btn.textContent="Найти мои локи"; return; }
+  }
+  btn.disabled=false; btn.textContent="Найти мои локи";
+  if(!mine.length){ box.innerHTML='<div class="card">Локов на этом кошельке не найдено.</div>'; return; }
+  const now = Math.floor(Date.now()/1000);
+  box.innerHTML = mine.map(l=>{
+    const matured = now>=l.unlockAt;
+    const vest = l.tranches>1?`<div class="meta">вестинг ${l.claimed}/${l.tranches} частей</div>`:"";
+    return `<div class="lock">
+      <div class="row"><div><div class="amt">${fmtN(l.amount)} GRM</div>${vest}</div>
+      <div style="text-align:right"><div class="meta">лок #${l.id}</div><div class="meta">разлок: ${fmtDate(l.unlockAt)}</div></div></div>
+      <div class="actions">
+        <a class="a-claim ${matured?"":"off"}" href="${unlockLink(l.id,false)}">${matured?"Забрать 100%":"⏳ ещё заперт"}</a>
+        <a class="a-emerg" href="${unlockLink(l.id,true)}">Срочно −10%</a>
+      </div></div>`;
+  }).join("");
 };
 </script>
 </body>
