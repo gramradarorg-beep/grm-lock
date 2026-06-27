@@ -45,4 +45,5 @@ struct LockView {
     createdAt: Int;     // = старт вестинга
     tranches: Int;      // число равных частей (1 = обычный обрыв)
     claimed: Int;       // сколько частей уже выдано
+    hardLock: Bool;     // жёсткий лок (досрочный вывод запрещён)
 }

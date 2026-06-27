@@ -43,6 +43,7 @@ struct Lock {
     startAt: Int as uint64;    // старт вестинга (= момент лока)
     tranches: Int as uint16;   // число равных частей (1 = всё одним обрывом в unlockAt)
     claimed: Int as uint16;    // сколько частей уже выдано
+    hardLock: Bool;            // жёсткий лок: досрочный вывод ЗАПРЕЩЁН (только после срока)
 }
 
 contract GrmLock with Deployable {
@@ -123,6 +124,9 @@ contract GrmLock with Deployable {
             tranches = body.loadUint(16);
             if (tranches < 1 || tranches > MAX_TRANCHES) { self.refund(msg.sender, msg.amount); return; }
         }
+        // опционально: флаг жёсткого лока (1 бит) — досрочный вывод запрещён.
+        let hard: Bool = false;
+        if (body.bits() >= 1) { hard = body.loadBit(); }
 
         // STORAGE-СТРАХОВКА: приложенного TON должно хватить на буфер ренты под весь срок.
         let need: Int = DEV_FEE_TON + STORAGE_BASE_TON + lockSeconds * STORAGE_PER_YEAR_TON / SEC_PER_YEAR;
@@ -139,7 +143,8 @@ contract GrmLock with Deployable {
             unlockAt: now() + lockSeconds,
             startAt: now(),
             tranches: tranches,
-            claimed: 0
+            claimed: 0,
+            hardLock: hard
         });
         self.totalLocked += msg.amount;
         self.activeLocks += 1;
@@ -188,6 +193,7 @@ contract GrmLock with Deployable {
         require(opt != null, "no such lock");
         let lock: Lock = opt!!;
         require(sender() == lock.owner, "only lock owner");
+        require(!lock.hardLock, "hard lock: no early withdrawal");  // жёсткий лок — досрочно нельзя
         require(myBalance() >= FWD_TON * 2 + KEEP_RESERVE, "low TON, attach gas");
 
         let sentBefore: Int = lock.amount * lock.claimed / lock.tranches;
@@ -244,13 +250,13 @@ contract GrmLock with Deployable {
     get fun lockInfo(id: Int): LockView {
         let opt: Lock? = self.locks.get(id);
         if (opt == null) {
-            return LockView{ exists: false, owner: myAddress(), amount: 0, unlockAt: 0, createdAt: 0, tranches: 0, claimed: 0 };
+            return LockView{ exists: false, owner: myAddress(), amount: 0, unlockAt: 0, createdAt: 0, tranches: 0, claimed: 0, hardLock: false };
         }
         let l: Lock = opt!!;
         return LockView{
             exists: true, owner: l.owner, amount: l.amount,
             unlockAt: l.unlockAt, createdAt: l.startAt,
-            tranches: l.tranches, claimed: l.claimed
+            tranches: l.tranches, claimed: l.claimed, hardLock: l.hardLock
         };
     }
 
