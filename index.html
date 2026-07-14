@@ -55,11 +55,10 @@
 </div>
 
 <script type="module">
-import { Address, Cell, Dictionary, beginCell } from "https://esm.sh/@ton/core@0.59.0";
-import { Buffer } from "https://esm.sh/buffer@6.0.3";
+// Библиотеки @ton/core + buffer вшиты локально (vendor/tonlib.js) — ноль внешних CDN.
+import { Address, Cell, Dictionary, beginCell, Buffer } from "./vendor/tonlib.js";
 
 const CONTRACT = "EQBdcJsNkghVtqEQ24lP9OwpFmiuzqgmAln_7nO_L5XqYH5n";
-const TONAPI = "https://tonapi.io";
 const OP_UNLOCK = 2337577242;   // 0x8B527ADA
 const OP_EMERG  = 3065175784;   // 0xB6B6FF68
 document.getElementById("caddr").textContent = CONTRACT;
@@ -69,27 +68,51 @@ const fmtN = (n) => Number(n).toLocaleString("ru-RU");
 function fmtDate(ts){ const d=new Date(ts*1000),p=n=>String(n).padStart(2,"0"); return `${p(d.getDate())}.${p(d.getMonth()+1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`; }
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 
-async function getter(method, args){
+// Чтение геттеров контракта. Два независимых публичных RPC — если один недоступен,
+// пробуем второй. Оба нормализуются в единый формат stack: [{num}|{cell(hex)}].
+async function readTonapi(method, args){
   const q = args!=null ? `?args=${args}` : "";
-  for(let i=0;i<4;i++){
-    try{ const r = await fetch(`${TONAPI}/v2/blockchain/accounts/${CONTRACT}/methods/${method}${q}`).then(x=>x.json()); if(r && r.stack) return r.stack; }catch(_){}
-    await sleep(1500); // публичный RPC бывает лимитит — ждём и повторяем
+  const r = await fetch(`https://tonapi.io/v2/blockchain/accounts/${CONTRACT}/methods/${method}${q}`).then(x=>x.json());
+  if(!r || !r.stack) throw new Error("no stack");
+  return r.stack; // tonapi уже отдаёт {num} / {cell:hex}
+}
+async function readToncenter(method, args){
+  const stack = (args!=null) ? [{ type:"num", value:String(args) }] : [];
+  const r = await fetch("https://toncenter.com/api/v3/runGetMethod",{
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ address: CONTRACT, method, stack })
+  }).then(x=>x.json());
+  if(!r || !r.stack) throw new Error("no stack");
+  // toncenter: {type:"num",value:"0x.."} | {type:"cell",value:"<base64 boc>"} → наш формат
+  return r.stack.map(it => it.type==="cell"
+    ? { cell: Buffer.from(it.value,"base64").toString("hex") }
+    : { num: it.value });
+}
+async function getter(method, args){
+  const sources = [readTonapi, readToncenter];
+  for(let i=0;i<6;i++){
+    for(const src of sources){
+      try{ const s = await src(method, args); if(s) return s; }catch(_){}
+    }
+    await sleep(900); // публичные RPC бывают лимитят (429) — ждём и повторяем
   }
-  throw new Error("RPC error");
+  return null; // не удалось прочитать (НЕ значит «лока нет» — это ошибка сети/лимит)
 }
 
 async function nextId(){
   try{
     const s = await getter("stats");
+    if(!s) return 128; // не прочитали stats — сканируем разумный диапазон
     const cell = Cell.fromBoc(Buffer.from(s[0].cell,"hex"))[0];
     const d = cell.beginParse().loadDictDirect(Dictionary.Keys.BigInt(257), Dictionary.Values.BigInt(257));
     return Number(d.get(0n) ?? 0n);
-  }catch(_){ return 300; } // фолбэк — сканируем до 300
+  }catch(_){ return 128; }
 }
 
 async function lockInfo(id){
   const s = await getter("lockInfo", id);
-  if(num(s[0].num) === 0n) return null; // exists=false (TVM true = -1)
+  if(s === null){ const e = new Error("rpc"); e.rpc = true; throw e; } // лимит/сеть — НЕ терять молча
+  if(num(s[0].num) === 0n) return null; // exists=false (TVM true = -1) — лока с таким id нет
   let owner=null; try{ owner = Cell.fromBoc(Buffer.from(s[1].cell,"hex"))[0].beginParse().loadAddress(); }catch(_){}
   return { id, owner, amount:Number(num(s[2].num))/1e9, unlockAt:Number(num(s[3].num)), createdAt:Number(num(s[4].num)), tranches:Number(num(s[5].num)), claimed:Number(num(s[6].num)), hardLock: s[7]?num(s[7].num)!==0n:false };
 }
@@ -109,24 +132,33 @@ window.findLocks = async function(){
   st.textContent = ""; box.innerHTML = "";
   let want;
   try{ want = Address.parse(inp).toRawString(); }catch(_){ st.textContent="Неверный адрес кошелька"; return; }
-  const btn = document.getElementById("find"); btn.disabled=true; btn.textContent="Ищем…";
-  let mine = null;
-  // 1) быстрый путь — API Gram Radar (если он работает)
-  try{
-    const r = await fetch("https://gramradar.org/api/lock/my?wallet="+encodeURIComponent(inp),{cache:"no-store"}).then(x=>x.json());
-    if(r && Array.isArray(r.locks)) mine = r.locks;
-  }catch(_){}
-  // 2) фолбэк — напрямую из блокчейна (если Gram Radar недоступен)
-  if(!mine){
-    btn.textContent="Сканирую блокчейн…";
-    try{
-      const N = await nextId(); mine = [];
-      for(let id=0; id<N; id++){
-        let info=null; try{ info=await lockInfo(id); }catch(_){}
-        if(info && info.owner && info.owner.toRawString()===want) mine.push(info);
-        await sleep(350);
+  const btn = document.getElementById("find"); btn.disabled=true; btn.textContent="Сканирую блокчейн…";
+  // Источник истины — ТОЛЬКО блокчейн (rescue не зависит от серверов Gram Radar).
+  let mine = [];
+  {
+    const N = await nextId();
+    // сканируем список id; недочитанные из-за лимита RPC НЕ теряем, а собираем и повторяем
+    async function scan(ids){
+      const failed = [];
+      for(const id of ids){
+        try{ const info = await lockInfo(id); if(info && info.owner && info.owner.toRawString()===want) mine.push(info); }
+        catch(e){ if(e && e.rpc) failed.push(id); } // сеть/лимит — в очередь на повтор
+        await sleep(450);
       }
-    }catch(e){ st.textContent="Не удалось прочитать блокчейн: "+(e.message||e); btn.disabled=false; btn.textContent="Найти мои локи"; return; }
+      return failed;
+    }
+    let ids = Array.from({length:N},(_,i)=>i);
+    let failed = await scan(ids);
+    // до двух авто-повторов только по недочитанным id
+    for(let r=0; r<2 && failed.length; r++){
+      btn.textContent="Дочитываю ("+failed.length+")…";
+      await sleep(1800);
+      failed = await scan(failed);
+    }
+    mine.sort((a,b)=>a.id-b.id);
+    if(failed.length){
+      st.textContent = "⚠️ "+failed.length+" лок(ов) не дочитано из-за лимита публичного RPC. Средства on-chain целы — подожди минуту и нажми «Найти» снова.";
+    }
   }
   btn.disabled=false; btn.textContent="Найти мои локи";
   if(!mine.length){ box.innerHTML='<div class="card">Локов на этом кошельке не найдено.</div>'; return; }
